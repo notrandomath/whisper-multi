@@ -85,6 +85,9 @@ class DecodingOptions:
     # language that the audio is in; uses detected language if None
     language: Optional[str] = None
 
+    # whether to return all groups or pick maximum rank
+    return_groups: bool = False
+
     # sampling-related options
     temperature: float = 0.0
     sample_len: Optional[int] = None  # maximum number of tokens to sample
@@ -179,7 +182,7 @@ class PyTorchInference(Inference):
 class SequenceRanker:
     def rank(
         self, tokens: List[List[Tensor]], sum_logprobs: List[List[float]]
-    ) -> List[int]:
+    ) -> List[Union[int, List[int]]]:
         """
         Given a list of groups of samples and their cumulative log probabilities,
         return the indices of the samples in each group to select as the final result
@@ -211,7 +214,32 @@ class MaximumLikelihoodRanker(SequenceRanker):
         # get the sequence with the highest score
         lengths = [[len(t) for t in s] for s in tokens]
         return [np.argmax(scores(p, l)) for p, l in zip(sum_logprobs, lengths)]
+    
+class MultiRanker(SequenceRanker):
+    """
+    Select the sample with the highest log probabilities, penalized using either
+    a simple length normalization or Google NMT paper's length penalty
+    """
 
+    def __init__(self, length_penalty: Optional[float]):
+        self.length_penalty = length_penalty
+
+    def rank(self, tokens: List[List[Tensor]], sum_logprobs: List[List[float]]):
+        def scores(logprobs, lengths):
+            result = []
+            for logprob, length in zip(logprobs, lengths):
+                if self.length_penalty is None:
+                    penalty = length
+                else:
+                    # from the Google NMT paper
+                    penalty = ((5 + length) / 6) ** self.length_penalty
+                result.append(-logprob / penalty)
+            return result
+
+        # get the sequence with the highest score
+        lengths = [[len(t) for t in s] for s in tokens]
+        # uses argsort instead of argmax to get most likely tokens, second most likely, etc.
+        return [np.argsort(scores(p, l)) for p, l in zip(sum_logprobs, lengths)]
 
 class TokenDecoder:
     def reset(self):
@@ -540,7 +568,11 @@ class DecodingTask:
         self.inference = PyTorchInference(model, len(self.initial_tokens))
 
         # sequence ranker: implements how to rank a group of sampled sequences
-        self.sequence_ranker = MaximumLikelihoodRanker(options.length_penalty)
+        self.sequence_ranker = MultiRanker(options.length_penalty) if options.return_groups \
+            else MaximumLikelihoodRanker(options.length_penalty)
+
+        # return groups: whether to return groups or pick maximum rank in group
+        self.return_groups = options.return_groups
 
         # decoder: implements how to select the next tokens, given the autoregressive distribution
         if options.beam_size is not None:
@@ -710,7 +742,7 @@ class DecodingTask:
         return tokens, sum_logprobs, no_speech_probs
 
     @torch.no_grad()
-    def run(self, mel: Tensor) -> List[DecodingResult]:
+    def run(self, mel: Tensor) -> Union[List[List[DecodingResult]], List[DecodingResult]]:
         self.decoder.reset()
         tokenizer: Tokenizer = self.tokenizer
         n_audio: int = mel.shape[0]
@@ -752,41 +784,52 @@ class DecodingTask:
         ]
 
         # select the top-ranked sample in each group
+        # or if returning groups, select in order of rank
         selected = self.sequence_ranker.rank(tokens, sum_logprobs)
-        tokens: List[List[int]] = [t[i].tolist() for i, t in zip(selected, tokens)]
-        texts: List[str] = [tokenizer.decode(t).strip() for t in tokens]
+        if not self.return_groups:
+            selected = [[i] for i in selected]
 
-        sum_logprobs: List[float] = [lp[i] for i, lp in zip(selected, sum_logprobs)]
-        avg_logprobs: List[float] = [
-            lp / (len(t) + 1) for t, lp in zip(tokens, sum_logprobs)
-        ]
+        results = []
+            
+        # get list of decoding results
+        for group_i in range(len(selected[0])):
+            cur_selected = [i[group_i] for i in selected]
+            cur_tokens: List[List[int]] = [t[i].tolist() for i, t in zip(cur_selected, tokens)]
+            texts: List[str] = [tokenizer.decode(t).strip() for t in cur_tokens]            
 
-        fields = (
-            texts,
-            languages,
-            tokens,
-            audio_features,
-            avg_logprobs,
-            no_speech_probs,
-        )
-        if len(set(map(len, fields))) != 1:
-            raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
+            cur_sum_logprobs: List[float] = [lp[i] for i, lp in zip(cur_selected, sum_logprobs)]
+            avg_logprobs: List[float] = [
+                lp / (len(t) + 1) for t, lp in zip(cur_tokens, cur_sum_logprobs)
+            ]
 
-        return [
-            DecodingResult(
-                audio_features=features,
-                language=language,
-                tokens=tokens,
-                text=text,
-                avg_logprob=avg_logprob,
-                no_speech_prob=no_speech_prob,
-                temperature=self.options.temperature,
-                compression_ratio=compression_ratio(text),
+            fields = (
+                texts,
+                languages,
+                cur_tokens,
+                audio_features,
+                avg_logprobs,
+                no_speech_probs,
             )
-            for text, language, tokens, features, avg_logprob, no_speech_prob in zip(
-                *fields
-            )
-        ]
+            if len(set(map(len, fields))) != 1:
+                raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
+
+            results.append([
+                DecodingResult(
+                    audio_features=features,
+                    language=language,
+                    tokens=cur_tokens,
+                    text=text,
+                    avg_logprob=avg_logprob,
+                    no_speech_prob=no_speech_prob,
+                    temperature=self.options.temperature,
+                    compression_ratio=compression_ratio(text),
+                )
+                for text, language, cur_tokens, features, avg_logprob, no_speech_prob in zip(
+                    *fields
+                )
+            ])
+
+        return results
 
 
 @torch.no_grad()
@@ -795,7 +838,7 @@ def decode(
     mel: Tensor,
     options: DecodingOptions = DecodingOptions(),
     **kwargs,
-) -> Union[DecodingResult, List[DecodingResult]]:
+) -> Union[DecodingResult, List[DecodingResult], List[List[DecodingResult]]]:
     """
     Performs decoding of 30-second audio segment(s), provided as Mel spectrogram(s).
 
@@ -822,5 +865,7 @@ def decode(
         options = replace(options, **kwargs)
 
     result = DecodingTask(model, options).run(mel)
-
-    return result[0] if single else result
+    # if a single group, get each item in that group
+    result = [entry[0] for entry in result] if single else result
+    # if a single audio segment, return that audio segment
+    return result[0] if len(result) == 1 else result
